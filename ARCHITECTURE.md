@@ -710,68 +710,523 @@ The Canvas is an **agent-driven visual workspace** that renders on macOS/iOS/And
 
 ---
 
-## Data Flow: Message to Response
+## Data Flows (By Example)
+
+The following examples trace real end-to-end data flows through OpenClaw, showing the exact function call chains and data transformations at each step.
+
+---
+
+### Example 1: WhatsApp DM → Agent → WhatsApp Reply
+
+A user sends "What's the weather?" to the OpenClaw WhatsApp number.
 
 ```
- 1. INBOUND
-    ┌──────────────┐
-    │ User sends   │  (e.g., WhatsApp message)
-    │ "Ship list"  │
-    └──────┬───────┘
-           │
- 2. CHANNEL PLUGIN
-           ▼
-    ┌──────────────────────────┐
-    │ WhatsApp Monitor         │
-    │ (Baileys WebSocket)      │
-    │ ├─ Normalize message     │
-    │ ├─ Check allowFrom       │
-    │ ├─ Check DM pairing      │
-    │ └─ Derive session key    │
-    └──────────┬───────────────┘
-               │
- 3. GATEWAY ROUTING
-               ▼
-    ┌──────────────────────────┐
-    │ Session Router           │
-    │ ├─ Resolve agent ID      │
-    │ ├─ Load/create session   │
-    │ ├─ Queue message         │
-    │ └─ Lane concurrency      │
-    └──────────┬───────────────┘
-               │
- 4. AGENT RUNTIME
-               ▼
-    ┌──────────────────────────┐
-    │ runEmbeddedPiAgent()     │
-    │ ├─ Build system prompt   │
-    │ │  (AGENTS.md + skills   │
-    │ │   + channel context)   │
-    │ ├─ Select model + auth   │
-    │ ├─ Call LLM provider     │
-    │ │  ┌───────────────────┐ │
-    │ │  │ Anthropic / OpenAI│ │
-    │ │  │ Google / Bedrock  │ │
-    │ │  │ Ollama / etc.     │ │
-    │ │  └───────────────────┘ │
-    │ ├─ Execute tool calls    │
-    │ │  (bash, browser, etc.) │
-    │ ├─ Stream text blocks    │
-    │ └─ Context window guard  │
-    └──────────┬───────────────┘
-               │
- 5. RESPONSE DELIVERY
-               ▼
-    ┌──────────────────────────┐
-    │ Block Streaming          │
-    │ ├─ Paragraph-aware split │
-    │ ├─ Per-channel chunk     │
-    │ │  limits (2K-4K chars)  │
-    │ ├─ Coalesce for Discord/ │
-    │ │  Slack (minChars/idle) │
-    │ └─ Deliver via channel   │
-    │    outbound adapter      │
-    └──────────────────────────┘
+ ┌──────────────────────────────────────────────────────────────────────────┐
+ │ 1. WHATSAPP INBOUND                                                     │
+ │                                                                          │
+ │ Baileys WebSocket receives raw WhatsApp protobuf message                │
+ │   ↓                                                                      │
+ │ monitorWhatsApp() → startAccount()                                      │
+ │   src/whatsapp/monitor.ts                                               │
+ │   ↓                                                                      │
+ │ Normalize to MsgContext:                                                │
+ │   normalizeWhatsAppTarget("5551234567@s.whatsapp.net")                  │
+ │   src/whatsapp/normalize.ts                                             │
+ │   ↓                                                                      │
+ │ Input data:                                                              │
+ │   { Body: "What's the weather?",                                        │
+ │     From: "5551234567@s.whatsapp.net",                                  │
+ │     To: "myphone@s.whatsapp.net",                                       │
+ │     Provider: "whatsapp",                                               │
+ │     ChatType: "direct" }                                                │
+ └──────────────────────────┬───────────────────────────────────────────────┘
+                            │
+ ┌──────────────────────────▼───────────────────────────────────────────────┐
+ │ 2. SECURITY CHECK                                                        │
+ │                                                                          │
+ │ Check DM pairing policy (dmPolicy="pairing"):                           │
+ │   Is sender in channels.whatsapp.allowFrom?                             │
+ │   ├─ YES → continue to dispatch                                         │
+ │   └─ NO  → send pairing code, ignore message                           │
+ │   src/channels/plugins/group-mentions.ts                                │
+ │   src/channels/allowlists/                                              │
+ └──────────────────────────┬───────────────────────────────────────────────┘
+                            │
+ ┌──────────────────────────▼───────────────────────────────────────────────┐
+ │ 3. SESSION ROUTING                                                       │
+ │                                                                          │
+ │ Derive session key:                                                      │
+ │   resolveSessionKeyForRun(ctx) → "agent:main:whatsapp:5551234567"       │
+ │   src/gateway/server-session-key.ts                                     │
+ │   ↓                                                                      │
+ │ Resolve agent ID from key → "main"                                      │
+ │   resolveAgentIdFromSessionKey()                                        │
+ │   src/routing/session-key.ts                                            │
+ │   ↓                                                                      │
+ │ Load/create session store entry                                          │
+ │   loadSessionStore("agent:main:whatsapp:5551234567")                    │
+ │   src/config/sessions.ts                                                │
+ │   ↓                                                                      │
+ │ Check lane concurrency (prevent parallel runs on same session)          │
+ │   resolveEmbeddedSessionLane()                                          │
+ │   src/agents/pi-embedded-runner/lanes.ts                                │
+ └──────────────────────────┬───────────────────────────────────────────────┘
+                            │
+ ┌──────────────────────────▼───────────────────────────────────────────────┐
+ │ 4. MESSAGE DISPATCH                                                      │
+ │                                                                          │
+ │ dispatchInboundMessage(ctx, cfg, dispatcher)                            │
+ │   src/auto-reply/dispatch.ts                                            │
+ │   ↓                                                                      │
+ │ dispatchReplyFromConfig({ctx, cfg})                                     │
+ │   ├─ Check for slash commands (/status, /new, /think, etc.)             │
+ │   ├─ Check auto-reply rules                                            │
+ │   └─ Route to agent execution                                          │
+ │   src/auto-reply/reply/dispatch-from-config.ts                          │
+ └──────────────────────────┬───────────────────────────────────────────────┘
+                            │
+ ┌──────────────────────────▼───────────────────────────────────────────────┐
+ │ 5. AGENT EXECUTION                                                       │
+ │                                                                          │
+ │ runEmbeddedPiAgent({                                                    │
+ │   sessionKey: "agent:main:whatsapp:5551234567",                         │
+ │   prompt: "[2026-02-13 09:15]\n+5551234567: What's the weather?",       │
+ │   agentId: "main",                                                      │
+ │   model: "anthropic/claude-opus-4-6"                                    │
+ │ })                                                                       │
+ │   src/agents/pi-embedded-runner/run.ts                                  │
+ │   ↓                                                                      │
+ │ Build system prompt:                                                     │
+ │   ├─ Load AGENTS.md from workspace                                      │
+ │   ├─ Inject active skills (weather, coding-agent, etc.)                 │
+ │   ├─ Add channel context ("You are on WhatsApp, replying to +555...")   │
+ │   └─ Add tool descriptions (40+ tools)                                  │
+ │   src/agents/system-prompt.ts                                           │
+ │   ↓                                                                      │
+ │ Select model + auth profile:                                             │
+ │   ├─ Try primary: anthropic/claude-opus-4-6 via OAuth session           │
+ │   ├─ On 429/timeout: fallback to API key                                │
+ │   └─ On total failure: try next profile                                 │
+ │   src/agents/model-selection.ts, src/agents/model-fallback.ts           │
+ │   ↓                                                                      │
+ │ Call LLM provider → Anthropic Claude API                                │
+ │   ↓                                                                      │
+ │ Agent might decide to use tools:                                         │
+ │   Tool call: web_search("weather in user's city")                       │
+ │   Tool result: { temperature: 72, conditions: "sunny" }                 │
+ │   ↓                                                                      │
+ │ Agent streams response text blocks:                                      │
+ │   "It's currently 72°F and sunny! ☀️"                                   │
+ │   ↓                                                                      │
+ │ Context window guard:                                                    │
+ │   Check if session approaching token limit                              │
+ │   If yes → trigger compaction (summarize history)                       │
+ │   src/agents/context-window-guard.ts                                    │
+ └──────────────────────────┬───────────────────────────────────────────────┘
+                            │
+ ┌──────────────────────────▼───────────────────────────────────────────────┐
+ │ 6. RESPONSE DELIVERY                                                     │
+ │                                                                          │
+ │ Agent emits text via onAgentEvent() handler                             │
+ │   src/infra/agent-events.ts → src/gateway/server-chat.ts               │
+ │   ↓                                                                      │
+ │ Block streaming pipeline:                                                │
+ │   ├─ Buffer text into paragraph-aware blocks                            │
+ │   ├─ WhatsApp chunk limit: 4000 chars                                   │
+ │   ├─ If response > 4000 chars → split into multiple messages            │
+ │   └─ Apply markdown → WhatsApp formatting                              │
+ │   ↓                                                                      │
+ │ Route reply to WhatsApp outbound:                                        │
+ │   routeReply() → ChannelOutboundAdapter.sendPayload()                   │
+ │   src/auto-reply/reply/route-reply.ts                                   │
+ │   ↓                                                                      │
+ │ Baileys sends WhatsApp protobuf message back to user:                   │
+ │   "It's currently 72°F and sunny! ☀️"                                   │
+ └──────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+### Example 2: WebChat Message → Agent with Browser Tool → WebChat Response
+
+A user types "Go to hackernews and find the top story" in the WebChat UI.
+
+```
+ ┌──────────────────────────────────────────────────────────────────────────┐
+ │ 1. WEBCHAT INBOUND (WebSocket RPC)                                       │
+ │                                                                          │
+ │ Browser Control UI sends WS message:                                    │
+ │   { method: "chat.send",                                                │
+ │     params: { sessionKey: "default",                                    │
+ │               message: "Go to hackernews and find the top story",       │
+ │               idempotencyKey: "a1b2c3d4" } }                            │
+ │   ↓                                                                      │
+ │ Gateway WS handler:                                                      │
+ │   "chat.send" method → server-methods/chat.ts                          │
+ │   ↓                                                                      │
+ │ Immediate ack to client:                                                 │
+ │   { ok: true, result: { runId: "a1b2c3d4", status: "started" } }       │
+ │                                                                          │
+ │ (Unlike channel messages, WebChat uses the WS protocol directly —       │
+ │  no channel plugin normalization needed)                                │
+ └──────────────────────────┬───────────────────────────────────────────────┘
+                            │
+ ┌──────────────────────────▼───────────────────────────────────────────────┐
+ │ 2. SESSION + AGENT DISPATCH                                              │
+ │                                                                          │
+ │ Build MsgContext:                                                        │
+ │   { Body: "Go to hackernews...",                                        │
+ │     Provider: "internal",                                               │
+ │     ChatType: "direct",                                                 │
+ │     SessionKey: "agent:main:main",                                      │
+ │     CommandAuthorized: true }                                           │
+ │   ↓                                                                      │
+ │ Register for tool events (WebChat supports streaming):                  │
+ │   registerToolEventRecipient(runId, connectionId)                       │
+ │   ↓                                                                      │
+ │ dispatchInboundMessage() → runEmbeddedPiAgent()                         │
+ │   (same agent execution path as channel messages)                       │
+ └──────────────────────────┬───────────────────────────────────────────────┘
+                            │
+ ┌──────────────────────────▼───────────────────────────────────────────────┐
+ │ 3. AGENT CALLS BROWSER TOOL (Multi-Step)                                 │
+ │                                                                          │
+ │ STEP A: Agent decides to navigate                                       │
+ │   Tool call: browser({ action: "navigate",                              │
+ │                         targetUrl: "https://news.ycombinator.com" })     │
+ │   ↓                                                                      │
+ │   browser-tool.ts → resolveBrowserBaseUrl(target="host")                │
+ │   ↓                                                                      │
+ │   browserNavigate("http://127.0.0.1:18791",                             │
+ │                    { url: "https://news.ycombinator.com" })              │
+ │   ↓                                                                      │
+ │   HTTP POST /navigate → Browser Control Server                          │
+ │   ↓                                                                      │
+ │   navigateViaPlaywright({ cdpUrl, url }) → Playwright page.goto()       │
+ │   ↓                                                                      │
+ │   Result: { ok: true, targetId: "ABC123", url: "https://news..." }      │
+ │                                                                          │
+ │ STEP B: Agent takes a snapshot to "see" the page                        │
+ │   Tool call: browser({ action: "snapshot", snapshotFormat: "ai" })      │
+ │   ↓                                                                      │
+ │   browserSnapshot("http://127.0.0.1:18791",                             │
+ │                    { format: "ai", maxChars: 80000 })                   │
+ │   ↓                                                                      │
+ │   HTTP GET /snapshot?format=ai → Browser Control Server                 │
+ │   ↓                                                                      │
+ │   snapshotAiViaPlaywright({ cdpUrl, targetId })                         │
+ │     → page._snapshotForAI()           (Playwright internal API)         │
+ │     → buildRoleSnapshotFromAiSnapshot() (generate e1,e2,... refs)       │
+ │     → storeRoleRefsForTarget()        (cache refs for next call)        │
+ │   ↓                                                                      │
+ │   Result (truncated):                                                    │
+ │     "- navigation \"Hacker News\"\n                                     │
+ │      - list\n                                                            │
+ │        - listitem\n                                                      │
+ │          - [e1] link \"Show HN: I built a...\"\n                        │
+ │          - text \"142 points by user123\"\n                             │
+ │        - listitem\n                                                      │
+ │          - [e2] link \"Why Rust is the future...\"\n                    │
+ │          ..."                                                            │
+ │                                                                          │
+ │ STEP C: Agent extracts information from snapshot text                   │
+ │   (No additional tool call — agent reads the snapshot and responds)     │
+ └──────────────────────────┬───────────────────────────────────────────────┘
+                            │
+ ┌──────────────────────────▼───────────────────────────────────────────────┐
+ │ 4. STREAMING RESPONSE TO WEBCHAT                                         │
+ │                                                                          │
+ │ Agent streams text → createAgentEventHandler()                          │
+ │   ↓                                                                      │
+ │ Emit chat deltas over WebSocket:                                        │
+ │   broadcast("chat", { runId: "a1b2c3d4",                               │
+ │     state: "delta", seq: 1,                                             │
+ │     message: { role: "assistant",                                       │
+ │       content: [{ type: "text",                                         │
+ │         text: "The top story on Hacker News right now is..." }] } })    │
+ │   ↓                                                                      │
+ │ Tool events also streamed (if verbose enabled):                         │
+ │   broadcast("agent", { type: "tool_call",                               │
+ │     tool: "browser", action: "navigate", ... })                         │
+ │   ↓                                                                      │
+ │ Final event:                                                             │
+ │   broadcast("chat", { runId: "a1b2c3d4",                               │
+ │     state: "final", seq: 3,                                             │
+ │     message: { role: "assistant",                                       │
+ │       content: [{ type: "text",                                         │
+ │         text: "The top story on HN is 'Show HN: I built a...'" }] } }) │
+ │                                                                          │
+ │ WebChat UI renders the streaming response in real-time                  │
+ └──────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+### Example 3: Cron Job → Agent → Telegram Delivery
+
+A cron job fires at 9 AM daily, running "Check my calendar and summarize today's meetings" and delivering to Telegram.
+
+```
+ ┌──────────────────────────────────────────────────────────────────────────┐
+ │ 1. CRON TRIGGER                                                          │
+ │                                                                          │
+ │ CronService timer tick (croner library)                                 │
+ │   src/cron/service.ts → service/timer.ts                                │
+ │   ↓                                                                      │
+ │ Job matches schedule: "0 9 * * *"                                       │
+ │   { id: "daily-cal", name: "Morning Calendar",                          │
+ │     schedule: "0 9 * * *",                                              │
+ │     payload: { kind: "agentTurn",                                       │
+ │       message: "Check my calendar and summarize today's meetings",      │
+ │       delivery: { channel: "telegram", to: "12345678" } } }            │
+ │   ↓                                                                      │
+ │ Gateway broadcasts cron event:                                           │
+ │   broadcast("cron", { action: "firing", jobId: "daily-cal" })           │
+ │   src/gateway/server-cron.ts                                            │
+ └──────────────────────────┬───────────────────────────────────────────────┘
+                            │
+ ┌──────────────────────────▼───────────────────────────────────────────────┐
+ │ 2. ISOLATED AGENT EXECUTION                                              │
+ │                                                                          │
+ │ runCronIsolatedAgentTurn({                                              │
+ │   cfg, job, sessionKey: "agent:main:cron:daily-cal", agentId: "main"   │
+ │ })                                                                       │
+ │   src/cron/isolated-agent/run.ts                                        │
+ │   ↓                                                                      │
+ │ Build command body with timestamp:                                       │
+ │   "[cron:daily-cal Morning Calendar] Check my calendar and              │
+ │    summarize today's meetings                                           │
+ │    [Time: 2026-02-13 09:00 UTC]"                                        │
+ │   ↓                                                                      │
+ │ runWithModelFallback({                                                   │
+ │   provider, model, agentDir,                                            │
+ │   run: (p, m) => runEmbeddedPiAgent({prompt: commandBody, ...})         │
+ │ })                                                                       │
+ │   ↓                                                                      │
+ │ Agent executes (may use tools like web_fetch for calendar API)           │
+ │   ↓                                                                      │
+ │ Agent produces response:                                                 │
+ │   "You have 3 meetings today:                                           │
+ │    9:30 AM - Standup (15 min)                                           │
+ │    11:00 AM - Design Review (1 hr)                                      │
+ │    2:00 PM - 1:1 with Manager (30 min)"                                 │
+ └──────────────────────────┬───────────────────────────────────────────────┘
+                            │
+ ┌──────────────────────────▼───────────────────────────────────────────────┐
+ │ 3. DELIVERY TO TELEGRAM                                                  │
+ │                                                                          │
+ │ Resolve delivery target:                                                 │
+ │   resolveDeliveryTarget(cfg, agentId, {channel: "telegram", to: "..."}) │
+ │   src/cron/isolated-agent/delivery-target.ts                            │
+ │   ↓                                                                      │
+ │ deliverOutboundPayloads({                                               │
+ │   cfg, channel: "telegram", to: "12345678",                             │
+ │   payloads: [{ text: "You have 3 meetings today: ..." }]               │
+ │ })                                                                       │
+ │   ↓                                                                      │
+ │ Telegram outbound adapter:                                               │
+ │   grammY bot.api.sendMessage(12345678, text)                            │
+ │   ↓                                                                      │
+ │ Log execution:                                                           │
+ │   appendCronRunLog({ jobId: "daily-cal", status: "ok",                  │
+ │     summary: "3 meetings", durationMs: 4200 })                          │
+ └──────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+### Example 4: iOS Node Camera Snap
+
+The agent needs to take a photo using the user's iPhone camera.
+
+```
+ ┌──────────────────────────────────────────────────────────────────────────┐
+ │ 1. AGENT TOOL CALL                                                       │
+ │                                                                          │
+ │ During conversation, agent decides to invoke camera:                    │
+ │   Tool call: nodes({ action: "invoke",                                  │
+ │     nodeId: "ios-1", command: "camera.snap", params: {} })              │
+ │   src/agents/tools/nodes-utils.ts                                       │
+ │   ↓                                                                      │
+ │ Resolve target node:                                                     │
+ │   listNodes({}) → find "ios-1" in connected nodes                       │
+ │   resolveNodeIdFromList(nodes, "ios-1")                                 │
+ └──────────────────────────┬───────────────────────────────────────────────┘
+                            │
+ ┌──────────────────────────▼───────────────────────────────────────────────┐
+ │ 2. GATEWAY → NODE (WebSocket)                                            │
+ │                                                                          │
+ │ callGatewayTool("node.invoke", {                                        │
+ │   nodeId: "ios-1", command: "camera.snap",                              │
+ │   params: {}, idempotencyKey: "uuid-1" })                               │
+ │   ↓                                                                      │
+ │ Gateway "node.invoke" handler:                                           │
+ │   src/gateway/server-methods/nodes.ts                                   │
+ │   ↓                                                                      │
+ │ NodeRegistry.invoke():                                                   │
+ │   requestId = randomUUID()                                              │
+ │   pendingInvokes.set(requestId, { resolve, reject, timer })             │
+ │   ↓                                                                      │
+ │ Send WS event to iOS node:                                              │
+ │   node.socket.send({                                                    │
+ │     type: "event",                                                      │
+ │     event: "node.invoke.request",                                       │
+ │     payload: { id: "req-uuid", nodeId: "ios-1",                         │
+ │                command: "camera.snap", paramsJSON: null,                 │
+ │                timeoutMs: 30000 } })                                    │
+ │   src/gateway/node-registry.ts                                          │
+ └──────────────────────────┬───────────────────────────────────────────────┘
+                            │  (WebSocket to iOS device over LAN/Tailscale)
+ ┌──────────────────────────▼───────────────────────────────────────────────┐
+ │ 3. iOS NODE EXECUTION                                                    │
+ │                                                                          │
+ │ OpenClaw iOS app receives node.invoke.request                           │
+ │   apps/ios/Sources/                                                     │
+ │   ↓                                                                      │
+ │ Execute camera.snap command:                                             │
+ │   ├─ Check TCC camera permission (iOS permission system)                │
+ │   ├─ Capture photo using AVCaptureSession                               │
+ │   ├─ Encode as JPEG, base64                                             │
+ │   └─ Build result payload                                               │
+ │   ↓                                                                      │
+ │ Send result back to Gateway:                                             │
+ │   socket.send({                                                         │
+ │     type: "event",                                                      │
+ │     event: "node.invoke.result",                                        │
+ │     payload: { id: "req-uuid", nodeId: "ios-1", ok: true,              │
+ │       payloadJSON: "{\"imagePath\":\"/tmp/snap.jpg\",                   │
+ │                      \"width\":4032,\"height\":3024,                    │
+ │                      \"base64\":\"...huge base64...\"}" } })            │
+ └──────────────────────────┬───────────────────────────────────────────────┘
+                            │
+ ┌──────────────────────────▼───────────────────────────────────────────────┐
+ │ 4. RESULT FLOWS BACK TO AGENT                                            │
+ │                                                                          │
+ │ Gateway receives "node.invoke.result" event:                            │
+ │   handleInvokeResult({ id: "req-uuid", ok: true, payload })            │
+ │   ↓                                                                      │
+ │ Resolve pending promise:                                                 │
+ │   pending = pendingInvokes.get("req-uuid")                              │
+ │   pending.resolve({ ok: true, payload: { imagePath, base64, ... } })   │
+ │   pendingInvokes.delete("req-uuid")                                     │
+ │   ↓                                                                      │
+ │ Persist media file locally:                                              │
+ │   saveMediaBuffer(buffer, "image/jpeg", "node") → "/media/node/abc.jpg"│
+ │   ↓                                                                      │
+ │ Tool result returned to agent runtime:                                   │
+ │   { ok: true, imagePath: "/media/node/abc.jpg",                         │
+ │     width: 4032, height: 3024 }                                         │
+ │   ↓                                                                      │
+ │ Agent can now analyze the image and respond to the user                 │
+ └──────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+### Example 5: Discord Group with @mention Activation
+
+A user posts "@OpenClaw summarize this thread" in a Discord channel.
+
+```
+ ┌──────────────────────────────────────────────────────────────────────────┐
+ │ 1. DISCORD INBOUND                                                       │
+ │                                                                          │
+ │ discord.js client receives MESSAGE_CREATE event                         │
+ │   src/discord/monitor.ts                                                │
+ │   ↓                                                                      │
+ │ Normalize to MsgContext:                                                │
+ │   { Body: "@OpenClaw summarize this thread",                            │
+ │     From: "user123",                                                    │
+ │     To: "channel456",                                                   │
+ │     Provider: "discord",                                                │
+ │     ChatType: "group",     ← group, not DM!                            │
+ │     SenderId: "user123",                                                │
+ │     SenderName: "Alice" }                                               │
+ └──────────────────────────┬───────────────────────────────────────────────┘
+                            │
+ ┌──────────────────────────▼───────────────────────────────────────────────┐
+ │ 2. GROUP ACTIVATION CHECK                                                │
+ │                                                                          │
+ │ resolveDiscordGroupRequireMention(cfg, groupId) → true (default)        │
+ │   src/channels/plugins/group-mentions.ts                                │
+ │   ↓                                                                      │
+ │ Mention gating:                                                          │
+ │   Does message contain bot @mention? → YES (<@BOT_ID> pattern)         │
+ │   Strip mention from body:                                               │
+ │     stripPatterns: ["<@!?\\d+>"]                                        │
+ │     Body becomes: "summarize this thread"                               │
+ │   src/channels/mention-gating.ts                                        │
+ │   ↓                                                                      │
+ │ Resolve group tool policy:                                               │
+ │   resolveDiscordGroupToolPolicy(cfg, groupId, senderId)                 │
+ │   → May restrict certain tools in group context                         │
+ └──────────────────────────┬───────────────────────────────────────────────┘
+                            │
+ ┌──────────────────────────▼───────────────────────────────────────────────┐
+ │ 3. SESSION ISOLATION                                                     │
+ │                                                                          │
+ │ Session key for this group:                                              │
+ │   "agent:main:discord:channel:channel456"                               │
+ │   (separate from user's DM session — full isolation)                    │
+ │   ↓                                                                      │
+ │ If sandbox.mode="non-main":                                              │
+ │   This group session runs in Docker sandbox                             │
+ │   Tools restricted to: bash, read, write, edit, sessions_*              │
+ │   Tools blocked: browser, canvas, nodes, cron, discord, gateway         │
+ │   src/agents/sandbox/                                                   │
+ └──────────────────────────┬───────────────────────────────────────────────┘
+                            │
+ ┌──────────────────────────▼───────────────────────────────────────────────┐
+ │ 4. AGENT + RESPONSE                                                      │
+ │                                                                          │
+ │ runEmbeddedPiAgent({                                                    │
+ │   prompt: "[timestamp]\nAlice: summarize this thread",                  │
+ │   sessionKey: "agent:main:discord:channel:channel456" })                │
+ │   ↓                                                                      │
+ │ Agent generates response (may be multi-paragraph)                       │
+ │   ↓                                                                      │
+ │ Discord streaming pipeline:                                              │
+ │   ├─ Block streaming with coalescing:                                   │
+ │   │   minChars: 1500, idleMs: 1000                                      │
+ │   │   (wait for 1500 chars or 1s of silence before sending)             │
+ │   ├─ Chunk limit: 2000 chars (Discord message limit)                    │
+ │   └─ Send via discord.js:                                               │
+ │       channel.send("Here's a summary of the thread: ...")               │
+ │                                                                          │
+ │ If response > 2000 chars: split into multiple Discord messages          │
+ │ Threading: reply depends on discord.replyToMode config                  │
+ └──────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+### Core Data Structures Across All Flows
+
+**MsgContext** (unified message format across all entry points):
+```typescript
+{
+  Body: string;                    // Raw message text
+  BodyForAgent: string;            // Timestamped text for agent
+  SessionKey: string;              // "agent:<agentId>:<channel>:<peer>"
+  Provider: string;                // "whatsapp" | "telegram" | "internal" | ...
+  ChatType: "direct" | "group";   // Message type
+  From: string;                    // Sender identifier
+  To: string;                      // Recipient/channel identifier
+  SenderId?: string;               // Group sender ID
+  SenderName?: string;             // Group sender display name
+  CommandAuthorized: boolean;      // Can run slash commands?
+}
+```
+
+**SessionKey** (routing identity):
+```
+agent:main:main                          → Owner's primary DM
+agent:main:whatsapp:5551234567           → WhatsApp DM with +5551234567
+agent:main:discord:channel:channel456    → Discord channel
+agent:main:telegram:group:12345          → Telegram group
+agent:main:cron:daily-cal                → Cron job session
+agent:main:subagent:uuid-123             → Spawned sub-agent
+agent:work:slack:dm:U12345               → "work" agent, Slack DM
 ```
 
 ---
