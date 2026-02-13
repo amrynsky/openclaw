@@ -1443,6 +1443,459 @@ openclaw/
 
 ---
 
+## Additional Important Patterns & Integrations
+
+### Voice & Text-to-Speech (TTS) Integration
+
+**Location**: `src/tts/tts.ts` (1584 lines), `src/infra/voicewake.ts`, `src/gateway/server-methods/tts.ts`, `src/gateway/server-methods/talk.ts`, `src/agents/tools/tts-tool.ts`
+
+The TTS subsystem converts agent text responses into spoken audio. It is both a **passive pipeline** (auto-attaching audio to replies) and an **active tool** (the agent can explicitly invoke TTS).
+
+```
+ ┌────────────────────────────── TTS Pipeline ──────────────────────────────┐
+ │                                                                          │
+ │   Agent Reply Text                                                       │
+ │         │                                                                │
+ │         ▼                                                                │
+ │   ┌─────────────────────┐   auto mode check                             │
+ │   │ maybeApplyTtsToPayload │◄── off | always | inbound | tagged         │
+ │   └──────────┬──────────┘                                               │
+ │              │ (if enabled)                                              │
+ │              ▼                                                           │
+ │   ┌─────────────────────┐                                               │
+ │   │  Parse [[tts:...]]  │  directives for voice/provider override       │
+ │   │  directives         │  e.g. [[tts:provider=openai voice=nova]]      │
+ │   └──────────┬──────────┘                                               │
+ │              ▼                                                           │
+ │   ┌─────────────────────┐                                               │
+ │   │  Text > maxLength?  │──yes──► summarizeText() via LLM              │
+ │   │  (default 1500)     │         (uses agent's model)                  │
+ │   └──────────┬──────────┘                                               │
+ │              │ no / after summary                                        │
+ │              ▼                                                           │
+ │   ┌─────────────────────┐                                               │
+ │   │  stripMarkdown()    │  ### → spoken text, no "hashtag"              │
+ │   └──────────┬──────────┘                                               │
+ │              ▼                                                           │
+ │   ┌─────────────────────────────────────────────┐                       │
+ │   │  Provider Fallback Chain                     │                      │
+ │   │  ┌───────────┐  ┌──────────┐  ┌──────────┐  │                      │
+ │   │  │  Edge TTS  │  │  OpenAI  │  │ElevenLabs│  │                      │
+ │   │  │ (free,     │  │ gpt-4o-  │  │ eleven_  │  │                      │
+ │   │  │  default)  │  │ mini-tts │  │ multi_v2 │  │                      │
+ │   │  └─────┬─────┘  └────┬─────┘  └────┬─────┘  │                      │
+ │   │        │ fail ──────►│ fail ───────►│        │                      │
+ │   └────────┼─────────────┼──────────────┼────────┘                      │
+ │            └─────────────┴──────────────┘                               │
+ │                     │                                                    │
+ │                     ▼                                                    │
+ │   ┌──────────────────────────────┐                                      │
+ │   │  Channel-Aware Output       │                                       │
+ │   │  Telegram → .opus (voice)   │                                       │
+ │   │  Others   → .mp3            │                                       │
+ │   │  Telephony → PCM raw        │                                       │
+ │   └──────────────────────────────┘                                      │
+ │                     │                                                    │
+ │                     ▼                                                    │
+ │   ReplyPayload.mediaUrl = /tmp/tts-xxx/voice-xxx.opus                   │
+ │   ReplyPayload.audioAsVoice = true (Telegram voice bubble)              │
+ └──────────────────────────────────────────────────────────────────────────┘
+```
+
+**Three TTS providers:**
+
+| Provider | Library/API | Default Model | Default Voice | Voices | Cost |
+|----------|------------|---------------|---------------|--------|------|
+| **Edge TTS** | `node-edge-tts` | N/A | `en-US-MichelleNeural` | Microsoft Edge voices | Free |
+| **OpenAI** | OpenAI API | `gpt-4o-mini-tts` | `alloy` | alloy, ash, coral, echo, fable + 4 more | Paid |
+| **ElevenLabs** | ElevenLabs API | `eleven_multilingual_v2` | Default voice ID | Custom voice IDs | Paid |
+
+**Four auto modes** (configured per-user in `settings/tts-prefs.json`):
+
+| Mode | Behavior |
+|------|----------|
+| `off` | TTS disabled — no audio generated |
+| `always` | Every agent reply gets audio |
+| `inbound` | Audio only when user's last message was audio/voice |
+| `tagged` | Audio only when agent output contains `[[tts]]` or `[[tts:text]]` directives |
+
+**Key design patterns:**
+
+1. **Auto-summarization**: When reply text exceeds `maxLength` (default 1500 chars), the system calls the agent's own LLM to summarize before synthesizing. This prevents quality degradation on long text while keeping the spoken response useful.
+
+2. **Inline directives**: The agent can control voice mid-reply via `[[tts:provider=openai voice=nova]]` tags. A model-override policy (configurable) determines which overrides are allowed.
+
+3. **Channel-aware output**: Telegram voice notes require Opus format; the system automatically outputs `.opus` for Telegram and `.mp3` for all others. The `audioAsVoice` flag tells the channel plugin to send as a voice bubble instead of a file attachment.
+
+4. **Provider fallback chain**: The user picks a primary provider. On failure, the system tries the remaining providers in order `[openai, elevenlabs, edge]`. Edge TTS serves as a free, always-available fallback.
+
+5. **System prompt injection**: When TTS is enabled, `buildTtsSystemPromptHint()` injects a hint into the agent's system prompt explaining the current auto mode, max length, and available directives.
+
+**Voice Wake Words** (`src/infra/voicewake.ts`):
+- Configurable trigger words: defaults are `["openclaw", "claude", "computer"]`
+- Persisted to `settings/voicewake.json`
+- Gateway methods: `voicewake.get`, `voicewake.set`
+- Changes broadcast to all connected mobile nodes via `broadcastVoiceWakeChanged()`
+
+**Talk Mode** (`src/gateway/server-methods/talk.ts`):
+- Push-to-talk relay between mobile companion apps and the gateway
+- `talk.mode` handler broadcasts enable/disable state to connected nodes
+- Requires a mobile node connection (iOS/Android) — gated by node registry check
+- API key resolution: reads ElevenLabs key from env or shell profiles (`src/config/talk.ts`)
+
+**TTS as Agent Tool** (`src/agents/tools/tts-tool.ts`):
+- Exposed as a `tts` tool in the agent's tool registry
+- Agent calls it explicitly: `tts({ text: "Hello", channel: "telegram" })`
+- Returns `MEDIA:/tmp/tts-xxx/voice-xxx.opus` — the agent copies this into its reply
+- Telegram Opus output gets `[[audio_as_voice]]` tag for voice bubble rendering
+
+**Gateway TTS API** (6 methods):
+| Method | Purpose |
+|--------|---------|
+| `tts.status` | Current TTS state (enabled, provider, fallbacks, API key availability) |
+| `tts.enable` / `tts.disable` | Toggle TTS on/off |
+| `tts.convert` | Convert text → audio file (returns path + metadata) |
+| `tts.setProvider` | Switch provider (openai, elevenlabs, edge) |
+| `tts.providers` | List available providers with configuration status |
+
+---
+
+### Memory & Vector Search
+
+**Location**: `src/memory/` (~46 files)
+
+The memory subsystem provides agents with **semantic search** over their workspace files and conversation transcripts. It implements a hybrid search engine combining vector similarity (semantic) and full-text search (lexical).
+
+```
+ ┌──────────────────────────── Memory Search ────────────────────────────┐
+ │                                                                       │
+ │   Agent query: "How does auth work?"                                  │
+ │         │                                                             │
+ │         ▼                                                             │
+ │   ┌───────────────────────────────────────────────────┐               │
+ │   │  MemorySearchManager Interface                    │               │
+ │   │  (Abstract — backend-agnostic)                    │               │
+ │   └──────────┬──────────────────────┬─────────────────┘               │
+ │              │                      │                                 │
+ │    ┌────────▼────────┐    ┌───────▼─────────────┐                    │
+ │    │ MemoryIndexManager│    │ QmdMemoryManager    │                    │
+ │    │ (SQLite builtin) │    │ (External QMD tool) │                    │
+ │    └────────┬────────┘    └───────┬─────────────┘                    │
+ │             │                     │                                   │
+ │             │  FallbackMemoryManager wraps QMD with                   │
+ │             │  auto-failover to builtin on any error                  │
+ │             │                                                         │
+ │             ▼                                                         │
+ │   ┌────────────────────────────────────────────────┐                  │
+ │   │  Hybrid Search Engine                          │                  │
+ │   │                                                │                  │
+ │   │  ┌────────────────┐    ┌──────────────────┐    │                  │
+ │   │  │  Vector Search  │    │  Keyword Search  │    │                  │
+ │   │  │  sqlite-vec     │    │  FTS5 + BM25     │    │                  │
+ │   │  │  HNSW index     │    │  term matching   │    │                  │
+ │   │  │  cosine sim.    │    │  1/(1+rank)      │    │                  │
+ │   │  └───────┬────────┘    └───────┬──────────┘    │                  │
+ │   │          │                     │                │                  │
+ │   │          └────────┬────────────┘                │                  │
+ │   │                   ▼                             │                  │
+ │   │     Merge: 0.7×vectorScore + 0.3×textScore     │                  │
+ │   │     Deduplicate → Re-rank → Filter → Limit     │                  │
+ │   └────────────────────────────────────────────────┘                  │
+ │                                                                       │
+ │   Embedding Providers (pluggable):                                    │
+ │   ┌──────────┐ ┌────────┐ ┌────────┐ ┌──────────────────┐            │
+ │   │  OpenAI   │ │ Voyage │ │ Gemini │ │ Local (llama.cpp)│            │
+ │   │ 3-small   │ │ 4-large│ │        │ │ embeddinggemma   │            │
+ │   │ 1536-dim  │ │1024-dim│ │ 768-dim│ │ offline/private  │            │
+ │   └──────────┘ └────────┘ └────────┘ └──────────────────┘            │
+ └───────────────────────────────────────────────────────────────────────┘
+```
+
+**Architecture layers:**
+
+1. **Manager Interface** (`MemorySearchManager`): Abstract API — `search()`, `readFile()`, `sync()`, `status()`. Backend-agnostic; all consumers code to this interface.
+
+2. **Builtin Backend** (`MemoryIndexManager`): SQLite database with `sqlite-vec` (HNSW vector index) and `FTS5` (full-text search). This is the default.
+
+3. **QMD Backend** (`QmdMemoryManager`): Optional external indexer with collection management, session transcript export, and session-scoped access rules.
+
+4. **Fallback Wrapper** (`FallbackMemoryManager`): Wraps QMD primary with automatic failover to builtin on any error. Transparent to callers.
+
+**Indexing pipeline:**
+
+```
+Sources (memory/ + sessions/ dirs)
+    │
+    ├─ Watch events (chokidar, debounced 500ms)
+    ├─ Session updates (message threshold)
+    ├─ Interval timer (default 5 min)
+    └─ Manual sync(force)
+         │
+         ▼
+   Chunk on markdown boundaries (## headers)
+   Enforce max 500 tokens per chunk
+         │
+         ▼
+   Embed via provider (with batch API + LRU cache)
+   Cache key: md5(source:path:lines:contentHash:model)
+         │
+         ▼
+   SQLite transaction: INSERT chunks → REBUILD vec0 + FTS5
+```
+
+**Hybrid search mechanics:**
+
+| Component | Technology | Scoring | Strengths |
+|-----------|-----------|---------|-----------|
+| Vector search | sqlite-vec (HNSW) | cosine similarity → [0,1] | Semantic meaning, synonyms, cross-language |
+| Keyword search | FTS5 (BM25) | 1/(1+bm25_rank) → [0,1] | Exact terms, domain-specific jargon |
+| Merge | Weighted combination | 0.7×vector + 0.3×keyword | Best of both approaches |
+
+**Graceful degradation**: If sqlite-vec fails → keyword-only. If FTS5 fails → vector-only. If both fail → empty results (no crash). The system continuously retries sqlite-vec loading.
+
+**Embedding provider auto-detection** (when `provider: "auto"`):
+1. Check local model availability
+2. Try remote providers in order: OpenAI → Gemini → Voyage (first with valid API key wins)
+3. If primary fails at runtime, fallback provider takes over
+
+**Performance characteristics:**
+- Search latency: ~50-200ms for 10K+ chunks (HNSW = O(log n))
+- Batch embedding: Groups chunks to max token limits, 4 concurrent requests, exponential backoff on rate limits
+- Embedding cache: LRU with 10K entry limit, survives reindex (hash-based seeding from old DB)
+- Incremental sync: Only re-embeds changed files (hash-based change detection)
+
+---
+
+### Media Understanding Pipeline
+
+**Location**: `src/media-understanding/` (~32 files)
+
+The media understanding pipeline automatically transcribes audio, describes images, and describes videos that arrive as message attachments. It converts multimodal content into text that gets injected into the agent's context.
+
+```
+ ┌─────────────────── Media Understanding Pipeline ───────────────────┐
+ │                                                                     │
+ │   Inbound message with attachment(s)                                │
+ │   (image, audio, video, or document)                                │
+ │         │                                                           │
+ │         ▼                                                           │
+ │   ┌─────────────────────────────────┐                               │
+ │   │  normalizeAttachments()         │                               │
+ │   │  Classify: image | audio | video│                               │
+ │   │  Check scope & size limits      │                               │
+ │   └──────────┬──────────────────────┘                               │
+ │              │                                                      │
+ │              ▼                                                      │
+ │   ┌──────────────────────────────────────────────────┐              │
+ │   │  For each capability (image → audio → video):    │              │
+ │   │                                                  │              │
+ │   │  1. Select matching attachments                  │              │
+ │   │  2. Resolve provider (config or auto-detect)     │              │
+ │   │  3. Run provider with fallback chain             │              │
+ │   │  4. Collect outputs (text transcriptions)        │              │
+ │   └──────────┬───────────────────────────────────────┘              │
+ │              │                                                      │
+ │              ▼                                                      │
+ │   ┌──────────────────────────────────────────────────┐              │
+ │   │  Provider Registry                               │              │
+ │   │                                                  │              │
+ │   │  Audio providers:                                │              │
+ │   │  ┌───────┐ ┌────────┐ ┌─────────┐ ┌──────────┐  │              │
+ │   │  │ Groq  │ │ OpenAI │ │Deepgram │ │  Google  │  │              │
+ │   │  │whisper│ │gpt-4o- │ │ nova-3  │ │          │  │              │
+ │   │  │large  │ │mini-tr │ │         │ │          │  │              │
+ │   │  └───────┘ └────────┘ └─────────┘ └──────────┘  │              │
+ │   │                                                  │              │
+ │   │  Image providers:                                │              │
+ │   │  ┌────────┐ ┌──────────┐ ┌────────┐ ┌────────┐  │              │
+ │   │  │ OpenAI │ │Anthropic │ │ Google │ │MiniMax │  │              │
+ │   │  │gpt-5-  │ │claude-   │ │gemini- │ │VL-01   │  │              │
+ │   │  │mini    │ │opus-4-6  │ │3-flash │ │        │  │              │
+ │   │  └────────┘ └──────────┘ └────────┘ └────────┘  │              │
+ │   │                                                  │              │
+ │   │  Video providers:                                │              │
+ │   │  ┌──────────┐                                    │              │
+ │   │  │  Google   │  (only provider with video)       │              │
+ │   │  │  Gemini   │                                   │              │
+ │   │  └──────────┘                                    │              │
+ │   └──────────────────────────────────────────────────┘              │
+ │              │                                                      │
+ │              ▼                                                      │
+ │   ┌──────────────────────────────────────────────────┐              │
+ │   │  Format & inject into agent context              │              │
+ │   │                                                  │              │
+ │   │  Audio → "[Audio transcription]: ..."            │              │
+ │   │  Image → "[Image description]: ..."              │              │
+ │   │  Video → "[Video description]: ..."              │              │
+ │   └──────────────────────────────────────────────────┘              │
+ └─────────────────────────────────────────────────────────────────────┘
+```
+
+**Provider interface** (`MediaUnderstandingProvider`):
+
+```typescript
+type MediaUnderstandingProvider = {
+  id: string;
+  capabilities?: ("image" | "audio" | "video")[];
+  transcribeAudio?: (req: AudioTranscriptionRequest) => Promise<AudioTranscriptionResult>;
+  describeVideo?: (req: VideoDescriptionRequest) => Promise<VideoDescriptionResult>;
+  describeImage?: (req: ImageDescriptionRequest) => Promise<ImageDescriptionResult>;
+};
+```
+
+Each provider implements one or more capabilities. The registry normalizes provider IDs (e.g., `gemini` → `google`) and supports overrides for custom providers.
+
+**7 providers:**
+
+| Provider | Audio | Image | Video | Default Audio Model | Default Image Model |
+|----------|-------|-------|-------|--------------------|--------------------|
+| **Groq** | yes | — | — | `whisper-large-v3-turbo` | — |
+| **OpenAI** | yes | yes | — | `gpt-4o-mini-transcribe` | `gpt-5-mini` |
+| **Deepgram** | yes | — | — | `nova-3` | — |
+| **Google** | yes | yes | yes | — | `gemini-3-flash-preview` |
+| **Anthropic** | — | yes | — | — | `claude-opus-4-6` |
+| **MiniMax** | — | yes | — | — | `MiniMax-VL-01` |
+| **Zai** | — | yes | — | — | `glm-4.6v` |
+
+**Auto-detection**: When no provider is configured, the system probes for API keys in priority order:
+- Audio: OpenAI → Groq → Deepgram → Google
+- Image: OpenAI → Anthropic → Google → MiniMax → Zai
+- Video: Google (only option)
+
+**Size limits and timeouts:**
+
+| Capability | Max Size | Timeout | Default Prompt |
+|-----------|----------|---------|----------------|
+| Image | 10 MB | 60s | "Describe the image." |
+| Audio | 20 MB | 60s | "Transcribe the audio." |
+| Video | 50 MB | 120s | "Describe the video." |
+
+**Concurrency**: Attachments are processed with configurable concurrency (default 2) via `runWithConcurrency()`. Multiple attachments in a single message are processed in parallel.
+
+**Integration with agent context**: The `applyMediaUnderstanding()` function in `apply.ts` orchestrates the full pipeline. It processes capabilities in order (`image → audio → video`), collects all outputs, and formats them as structured text blocks injected before the user's message text in the agent's context.
+
+**Document/file understanding**: Beyond media, the pipeline also handles text-based file attachments (CSV, JSON, YAML, XML, Markdown, etc.) via MIME type detection and content extraction. PDFs are supported with configurable page limits.
+
+---
+
+### Cron Scheduler
+
+**Location**: `src/cron/` (~35 files)
+
+The cron subsystem enables scheduled agent tasks — from periodic check-ins to timed reminders delivered to specific channels.
+
+```
+ ┌───────────────────────── Cron Subsystem ─────────────────────────┐
+ │                                                                   │
+ │   CronJob definition:                                             │
+ │   ┌────────────────────────────────────────────────────────┐      │
+ │   │  id: "job_abc123"                                      │      │
+ │   │  name: "Daily briefing"                                │      │
+ │   │  schedule: { kind: "cron", expr: "0 9 * * *", tz: "EST" }│   │
+ │   │  sessionTarget: "main" | "isolated"                    │      │
+ │   │  payload: {                                            │      │
+ │   │    kind: "agentTurn",                                  │      │
+ │   │    message: "Give me today's briefing",                │      │
+ │   │    model: "anthropic/claude-opus-4-6"                  │      │
+ │   │  }                                                     │      │
+ │   │  delivery: {                                           │      │
+ │   │    mode: "announce",                                   │      │
+ │   │    channel: "telegram",                                │      │
+ │   │    to: "user123"                                       │      │
+ │   │  }                                                     │      │
+ │   └────────────────────────────────────────────────────────┘      │
+ │                                                                   │
+ │   Schedule types:                                                 │
+ │   • { kind: "at",   at: "2024-03-15T09:00:00Z" }  ← one-shot   │
+ │   • { kind: "every", everyMs: 3600000 }            ← interval   │
+ │   • { kind: "cron",  expr: "0 9 * * *", tz: "EST" }← crontab   │
+ │                                                                   │
+ │   Payload types:                                                  │
+ │   • systemEvent: Injects text as system context                   │
+ │   • agentTurn: Sends message to agent, gets response              │
+ │     (with optional model override, timeout, delivery target)      │
+ │                                                                   │
+ │   Delivery plan resolution:                                       │
+ │   channel → "telegram" | "whatsapp" | "last" (most recent)       │
+ │   mode → "announce" (send to channel) | "none" (silent)          │
+ │                                                                   │
+ │   Session targets:                                                │
+ │   • "main": Runs in the agent's main session                     │
+ │   • "isolated": Runs in a dedicated isolated session              │
+ └───────────────────────────────────────────────────────────────────┘
+```
+
+**Key types:**
+
+- **CronSchedule**: Three schedule kinds — one-shot (`at`), interval (`every` with everyMs), and crontab (`cron` with expr + timezone)
+- **CronPayload**: Either `systemEvent` (inject text) or `agentTurn` (full agent conversation with optional model override and timeout)
+- **CronDelivery**: Where to send the result — mode (`announce`/`none`), channel (specific or `last`), and recipient (`to`)
+- **CronJobState**: Runtime state — `nextRunAtMs`, `lastStatus`, `consecutiveErrors`, `scheduleErrorCount` (auto-disables after threshold)
+
+**Delivery plan resolution** (`delivery.ts`): The `resolveCronDeliveryPlan()` function merges delivery config from both the `delivery` field and legacy `payload` fields. It normalizes channel selection (defaulting to `"last"` — the most recently active channel) and determines whether the result should actually be sent.
+
+**Session isolation**: Jobs can target `"main"` (shared session) or `"isolated"` (dedicated session via `isolated-agent.ts`). Isolated sessions prevent cron jobs from polluting the main conversation context.
+
+**Job lifecycle**: Jobs track `consecutiveErrors` with automatic backoff and `scheduleErrorCount` for auto-disabling broken schedules. One-shot jobs (`deleteAfterRun: true`) self-delete after execution.
+
+**Store**: Jobs are persisted to a JSON file (`CronStoreFile` with `version: 1` schema) with migration support for payload format changes.
+
+---
+
+### Telephony Integration
+
+**Location**: `src/tts/tts.ts` (telephony functions), `src/media-understanding/` (audio transcription)
+
+The telephony path is a specialized variant of the TTS pipeline for real-time voice calls. When a call comes in:
+
+1. **Inbound audio** → Media understanding pipeline transcribes via Whisper/Deepgram/Groq → text injected as user message
+2. **Agent processes** the text and generates a reply
+3. **`textToSpeechTelephony()`** converts reply to PCM raw audio (24kHz for OpenAI, 22.05kHz for ElevenLabs) — no file I/O, returns `Buffer` directly
+4. **PCM buffer** streamed back to telephony bridge
+
+This creates a full voice-in, voice-out loop optimized for low latency (raw PCM avoids codec overhead).
+
+---
+
+### Skills Platform
+
+**Location**: `skills/` (50+ bundled skills), agent workspace `SKILL.md` files
+
+Skills are **prompt files, not code**. Each skill is a `SKILL.md` markdown file that gets injected into the agent's system prompt at runtime. This makes skills:
+
+- **Trivially portable**: Copy a markdown file to add a capability
+- **Versionable**: Git-friendly text files
+- **Composable**: Multiple skills active simultaneously
+- **User-customizable**: Edit text, not code
+
+The system prompt is dynamically assembled from: `AGENTS.md` (personality) + `SOUL.md` (core instructions) + `TOOLS.md` (tool guidance) + active skill files. This "file-as-config" approach means agent behavior is fully customizable through text editing.
+
+Over 50 bundled skills cover domains like coding, writing, research, scheduling, and more. Users can create custom skills by adding `.md` files to the workspace.
+
+---
+
+### Sandbox & Docker Isolation
+
+**Location**: `Dockerfile`, `Dockerfile.sandbox`, `Dockerfile.sandbox-browser`
+
+OpenClaw provides three container configurations for defense-in-depth:
+
+| Container | Base | Purpose | Key Features |
+|-----------|------|---------|-------------|
+| `Dockerfile` | Node.js | Production runtime | Full Gateway + all channels |
+| `Dockerfile.sandbox` | Node.js | Tool execution sandbox | Restricted filesystem, no network by default |
+| `Dockerfile.sandbox-browser` | Debian bookworm-slim | Browser sandbox | Chromium + Xvfb + x11vnc + noVNC, ports 9222/5900/6080 |
+
+The browser sandbox runs a full headless Chromium environment with:
+- **Xvfb**: Virtual framebuffer for headless rendering
+- **x11vnc + noVNC**: Web-based VNC for visual debugging (port 6080)
+- **CDP access**: Chrome DevTools Protocol on port 9222
+- **Bridge server**: Connects sandbox browser back to the Gateway's browser control service
+
+Non-main sessions can be configured to execute tools inside the sandbox container, preventing untrusted operations from affecting the host system.
+
+---
+
 ## Architectural Insights
 
 ### 1. Single-Process, Event-Driven Gateway
