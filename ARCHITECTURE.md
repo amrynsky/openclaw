@@ -394,17 +394,296 @@ Nodes are **peripheral devices** that connect to the Gateway and expose device-l
 
 ---
 
-### 8. Browser Control
+### 8. Browser Control (Deep Dive)
 
-**Location**: `src/browser/`
+**Location**: `src/browser/` (~50 source files)
 
-Browser control provides the agent with **full web automation** via a dedicated Chrome/Chromium instance.
+The browser subsystem gives the agent **full web automation** — navigating pages, clicking elements, filling forms, taking screenshots, extracting page content, and managing file uploads/downloads. It is one of OpenClaw's most sophisticated subsystems with a multi-layered architecture.
 
-- Uses **Playwright** (`playwright-core`) with CDP (Chrome DevTools Protocol)
-- Manages a separate browser process with its own profile
-- Supports: navigation, clicking, typing, screenshots, file uploads, snapshot-based interaction
-- The agent calls the `browser` tool which delegates to the browser control server
-- Browser server lifecycle managed by the Gateway (`src/gateway/server-browser.ts`)
+#### Architecture Overview
+
+```
+ ┌──────────────────────── Browser Subsystem ───────────────────────────────┐
+ │                                                                          │
+ │  Agent Tool Layer                                                        │
+ │  ┌──────────────────────────────────────────────────────────────────┐    │
+ │  │  browser tool (src/agents/tools/browser-tool.ts)                 │    │
+ │  │  Actions: status|start|stop|profiles|tabs|open|focus|close|      │    │
+ │  │           snapshot|screenshot|navigate|console|pdf|upload|        │    │
+ │  │           dialog|act                                             │    │
+ │  │  Target routing: sandbox | host | node (auto-resolved)           │    │
+ │  └──────────────────────────┬───────────────────────────────────────┘    │
+ │                             │                                            │
+ │                     ┌───────┴────────┐                                   │
+ │                     ▼                ▼                                    │
+ │  ┌──────────────────────┐  ┌────────────────────────┐                   │
+ │  │  Browser Client      │  │  Node Browser Proxy    │                   │
+ │  │  (client.ts)         │  │  (browser.proxy cmd)   │                   │
+ │  │  HTTP calls to local │  │  Forwards via          │                   │
+ │  │  control server      │  │  node.invoke to remote │                   │
+ │  └──────────┬───────────┘  │  device node           │                   │
+ │             │              └────────────────────────┘                   │
+ │             ▼                                                            │
+ │  Browser Control Server / Service                                        │
+ │  ┌──────────────────────────────────────────────────────────────────┐    │
+ │  │  Express HTTP server on 127.0.0.1:<controlPort>                  │    │
+ │  │  (server.ts / control-service.ts)                                │    │
+ │  │                                                                  │    │
+ │  │  Routes (routes/):                                               │    │
+ │  │  ├─ basic: GET /, POST /start, POST /stop, GET /profiles,       │    │
+ │  │  │         POST /profiles/create, DELETE /profiles/<name>,       │    │
+ │  │  │         POST /reset-profile                                   │    │
+ │  │  ├─ tabs:  GET /tabs, POST /tabs/open, POST /tabs/focus,        │    │
+ │  │  │         DELETE /tabs/<targetId>, POST /tabs/action            │    │
+ │  │  └─ agent: GET /snapshot, POST /screenshot, POST /navigate,     │    │
+ │  │            POST /act, GET /console, POST /pdf,                   │    │
+ │  │            POST /hooks/file-chooser, POST /hooks/dialog          │    │
+ │  └──────────────────────────┬───────────────────────────────────────┘    │
+ │                             │                                            │
+ │  ┌──────────────────────────┴───────────────────────────────────────┐    │
+ │  │                   Profile System                                  │    │
+ │  │  ┌─────────────────────┐  ┌──────────────────────────────────┐   │    │
+ │  │  │ "openclaw" profile  │  │ "chrome" profile                 │   │    │
+ │  │  │ (driver: openclaw)  │  │ (driver: extension)              │   │    │
+ │  │  │                     │  │                                  │   │    │
+ │  │  │ Launches dedicated  │  │ Attaches to user's existing     │   │    │
+ │  │  │ Chrome/Chromium     │  │ Chrome via Extension Relay      │   │    │
+ │  │  │ with isolated       │  │                                  │   │    │
+ │  │  │ user-data-dir       │  │ User clicks toolbar icon to     │   │    │
+ │  │  │ + custom color bar  │  │ attach/detach tabs              │   │    │
+ │  │  └────────┬────────────┘  └──────────────┬───────────────────┘   │    │
+ │  │           │                               │                      │    │
+ │  │           ▼                               ▼                      │    │
+ │  │  Chrome Process (CDP)           Extension Relay Server           │    │
+ │  │  ├─ --remote-debugging-port     (extension-relay.ts)             │    │
+ │  │  ├─ Managed lifecycle           ├─ WS server for extension       │    │
+ │  │  ├─ Profile decoration          ├─ CDP command forwarding        │    │
+ │  │  │  (colored address bar)       ├─ Multi-target session mgmt    │    │
+ │  │  └─ Auto-detect executable      └─ Auth via relay token         │    │
+ │  └──────────────────────────────────────────────────────────────────┘    │
+ │                             │                                            │
+ │                             ▼                                            │
+ │  Playwright Integration Layer                                            │
+ │  ┌──────────────────────────────────────────────────────────────────┐    │
+ │  │  pw-session.ts    — Connect to Chrome via CDP, manage pages      │    │
+ │  │  pw-ai.ts         — Export all Playwright-based operations       │    │
+ │  │  pw-tools-core.ts — 60+ Playwright operations:                   │    │
+ │  │    ├─ Snapshot:  snapshotAi, snapshotAria, snapshotRole          │    │
+ │  │    ├─ Actions:   click, type, hover, drag, select, fill, press   │    │
+ │  │    ├─ Navigate:  navigate, wait, evaluate                        │    │
+ │  │    ├─ Capture:   screenshot, screenshotWithLabels, pdf, trace    │    │
+ │  │    ├─ Files:     armFileUpload, waitForDownload                  │    │
+ │  │    ├─ Dialog:    armDialog                                       │    │
+ │  │    ├─ State:     cookies, storage, httpCredentials, locale, tz   │    │
+ │  │    └─ Device:    emulateMedia, setDevice, setGeolocation         │    │
+ │  │                                                                  │    │
+ │  │  pw-role-snapshot.ts — Accessibility tree → ref-based snapshot   │    │
+ │  │    ├─ Role-based refs (e1, e2, ...) from aria role + name        │    │
+ │  │    ├─ Interactive element detection (buttons, links, inputs)      │    │
+ │  │    ├─ Compact mode (strip unnamed structural elements)           │    │
+ │  │    └─ Stats: line count, char count, ref count, interactive count│    │
+ │  └──────────────────────────────────────────────────────────────────┘    │
+ │                                                                          │
+ │  CDP Layer                                                               │
+ │  ┌──────────────────────────────────────────────────────────────────┐    │
+ │  │  cdp.ts / cdp.helpers.ts — Raw Chrome DevTools Protocol          │    │
+ │  │  ├─ WebSocket connection to Chrome debugging endpoint            │    │
+ │  │  ├─ Page.captureScreenshot, Page.getLayoutMetrics                │    │
+ │  │  ├─ Accessibility.getFullAXTree                                  │    │
+ │  │  ├─ Target.createTarget, Target.activateTarget                   │    │
+ │  │  └─ Auth headers for remote CDP endpoints                        │    │
+ │  └──────────────────────────────────────────────────────────────────┘    │
+ └──────────────────────────────────────────────────────────────────────────┘
+```
+
+#### Dual-Profile Model
+
+The browser subsystem implements two distinct **drivers** for controlling Chrome, managed via a profile system:
+
+**1. `openclaw` driver** — Dedicated, isolated browser
+- Launches a **new Chrome/Chromium process** with `--remote-debugging-port` for CDP access
+- Uses an isolated user data directory (`~/.openclaw/browser/<profile>/user-data/`) so it doesn't interfere with the user's personal Chrome
+- Applies **profile decoration**: a colored address bar (`#FF4500` orange by default) to visually distinguish the OpenClaw-controlled browser
+- Auto-detects Chrome/Chromium executables across platforms (macOS: `/Applications/Google Chrome.app`, Linux: `chromium`, `google-chrome`, Windows: Program Files)
+- Supports headless mode (`browser.headless: true`) and `--no-sandbox` for Docker/CI environments
+- Lifecycle: `POST /start` → launches Chrome → `POST /stop` → kills process
+
+**2. `extension` driver** — Chrome Extension Relay (takeover mode)
+- Attaches to the user's **existing Chrome tabs** via the **OpenClaw Browser Relay** extension
+- The user installs a Chrome extension and clicks the toolbar icon on tabs they want to expose
+- A local **Extension Relay Server** (`extension-relay.ts`) acts as a CDP bridge:
+  - Chrome extension connects to relay via WebSocket
+  - Relay receives CDP commands from Playwright/agent and forwards them to the extension
+  - Extension forwards commands to Chrome's internal `chrome.debugger` API
+  - CDP events flow back through the same path
+- Multi-target session management: tracks `AttachedToTarget` / `DetachedFromTarget` events to maintain session-to-target mappings
+- Auth: relay token (`x-openclaw-relay-token`) secures the WebSocket connection
+
+```
+ Chrome Extension Relay Flow:
+
+  Agent ──► browser tool ──► Browser Client ──► Control Server
+                                                      │
+                                                      ▼
+                                               Extension Relay Server
+                                               (WS on controlPort+1)
+                                                      │
+                                    ┌─────────────────┤
+                                    ▼                  ▼
+                             Chrome Extension    Chrome Extension
+                             (Tab A attached)    (Tab B attached)
+                                    │                  │
+                                    ▼                  ▼
+                             chrome.debugger      chrome.debugger
+                             CDP protocol         CDP protocol
+```
+
+#### Page Snapshot System (The Agent's "Eyes")
+
+The snapshot system is how the agent **sees** web pages. It converts the browser's accessibility tree into a compact, ref-annotated text representation.
+
+**Snapshot formats:**
+
+| Format | Description | Use case |
+|--------|-------------|----------|
+| `ai` | Playwright's `_snapshotForAI()` — compact text with `[e1]`, `[e2]` element refs | Primary format for agent interaction |
+| `aria` | Full accessibility tree from `Accessibility.getFullAXTree` CDP call | Detailed structural analysis |
+| `role` | Role-based snapshot built from aria tree | Legacy/fallback |
+
+**Ref system:**
+- Each interactive element gets a short ref like `e1`, `e2`, `e12`
+- Refs map to `{ role, name, nth }` tuples (e.g. `e5 → { role: "button", name: "Submit" }`)
+- The agent uses these refs in subsequent `act` commands: `{ kind: "click", ref: "e5" }`
+- Refs persist across consecutive calls on the same tab via `storeRoleRefsForTarget()`
+- Two ref modes: `role` (resolved via `page.getByRole()`) and `aria` (Playwright aria-ref IDs)
+
+**Snapshot options:**
+- `maxChars`: Truncation limit (default 80,000 chars; efficient mode: 10,000)
+- `interactive`: Only include interactive elements (buttons, links, inputs, etc.)
+- `compact`: Strip unnamed structural elements and empty branches
+- `depth`: Maximum tree depth
+- `selector` / `frame`: Scope snapshot to a CSS selector or iframe
+- `labels`: Overlay element labels on a screenshot image
+- `mode: "efficient"`: Low-token-cost mode with reduced depth and chars
+
+#### Agent Tool Actions
+
+The `browser` tool exposes these actions to the agent:
+
+| Action | HTTP Route | Description |
+|--------|-----------|-------------|
+| `status` | `GET /` | Check browser state (running, CDP ready, PID, profile) |
+| `start` | `POST /start` | Launch Chrome (openclaw driver) or verify relay (extension driver) |
+| `stop` | `POST /stop` | Kill Chrome process or disconnect |
+| `profiles` | `GET /profiles` | List all configured profiles with status |
+| `tabs` | `GET /tabs` | List open tabs (targetId, title, URL, wsUrl) |
+| `open` | `POST /tabs/open` | Open a new tab with a URL |
+| `focus` | `POST /tabs/focus` | Activate/focus a tab by targetId |
+| `close` | `DELETE /tabs/<id>` | Close a specific tab |
+| `snapshot` | `GET /snapshot` | Get page content as text with element refs |
+| `screenshot` | `POST /screenshot` | Capture PNG/JPEG screenshot (full page, element, or ref) |
+| `navigate` | `POST /navigate` | Navigate to a URL in a specific tab |
+| `act` | `POST /act` | Interact with elements (click, type, hover, drag, select, fill, press, scroll, wait, evaluate, close) |
+| `console` | `GET /console` | Get browser console messages |
+| `pdf` | `POST /pdf` | Save page as PDF |
+| `upload` | `POST /hooks/file-chooser` | Upload files via file chooser dialog |
+| `dialog` | `POST /hooks/dialog` | Accept/dismiss browser dialogs |
+
+#### Act Command Types
+
+The `act` action supports rich browser interactions:
+
+```typescript
+{ kind: "click",   ref: "e5", doubleClick?: bool, button?: "left"|"right", modifiers?: ["Shift"] }
+{ kind: "type",    ref: "e3", text: "hello", submit?: bool, slowly?: bool }
+{ kind: "press",   key: "Enter", delayMs?: 100 }
+{ kind: "hover",   ref: "e7" }
+{ kind: "drag",    startRef: "e2", endRef: "e9" }
+{ kind: "select",  ref: "e4", values: ["option1", "option2"] }
+{ kind: "fill",    fields: [{ ref: "e1", type: "text", value: "John" }, ...] }
+{ kind: "resize",  width: 1280, height: 720 }
+{ kind: "wait",    text?: "Loading complete", selector?: ".ready", timeoutMs?: 5000 }
+{ kind: "evaluate", fn: "document.title", ref?: "e3" }
+{ kind: "close" }
+```
+
+#### Target Routing: Sandbox, Host, and Node
+
+The browser tool supports three execution targets:
+
+```
+ ┌─────────────────── Browser Target Routing ───────────────────────┐
+ │                                                                   │
+ │  target="host" (default for main sessions)                       │
+ │  ├─ Browser runs on the Gateway host machine                     │
+ │  ├─ Full access to host Chrome/Chromium                          │
+ │  └─ Agent calls local Browser Control Server via HTTP            │
+ │                                                                   │
+ │  target="sandbox" (for sandboxed sessions)                       │
+ │  ├─ Browser runs in a Docker container (Dockerfile.sandbox-      │
+ │  │   browser)                                                     │
+ │  ├─ Container runs: Xvfb + Chromium + x11vnc + noVNC             │
+ │  ├─ Agent calls sandbox Bridge Server via bridgeUrl               │
+ │  └─ Isolated from host filesystem and network                    │
+ │                                                                   │
+ │  target="node" (remote device)                                   │
+ │  ├─ Browser runs on a connected device node (macOS/iOS)          │
+ │  ├─ Agent tool calls are forwarded via Gateway node.invoke       │
+ │  ├─ Node executes browser.proxy command locally                  │
+ │  ├─ Result (including base64 screenshots) sent back via WS       │
+ │  └─ Auto-resolved when a single browser-capable node is online   │
+ └───────────────────────────────────────────────────────────────────┘
+```
+
+**Sandbox browser container** (`Dockerfile.sandbox-browser`):
+- Debian bookworm-slim with Chromium, Xvfb (virtual display), x11vnc (VNC server), noVNC (web VNC), websockify
+- Exposes ports: 9222 (CDP), 5900 (VNC), 6080 (noVNC web)
+- The agent interacts via CDP; the user can watch via noVNC in a browser
+
+#### Lifecycle & Gateway Integration
+
+1. **Gateway startup** (`server-browser.ts`): lazily imports the browser control service and calls `startBrowserControlServiceFromConfig()`
+2. **Browser Control Service** (`control-service.ts`): initializes state, resolves profiles from config, eagerly starts Chrome Extension Relay servers for any `extension`-driver profiles
+3. **On first `browser` tool call**: the agent's tool code resolves the target (sandbox/host/node), then either calls the local HTTP control server or proxies through a device node
+4. **Profile management**: profiles are stored in config (`browser.profiles`), each with a CDP port, color, and driver type. Profiles can be created/deleted at runtime via the API
+5. **Shutdown**: Gateway calls `stopBrowserControlServer()` which stops all running Chrome instances across all profiles and closes Playwright connections
+
+#### Configuration
+
+```json5
+{
+  browser: {
+    enabled: true,           // Enable browser control (default: true)
+    headless: false,         // Run Chrome headless
+    noSandbox: false,        // --no-sandbox flag (for Docker)
+    evaluateEnabled: true,   // Allow JS evaluate in pages
+    executablePath: null,    // Custom Chrome path (auto-detect by default)
+    defaultProfile: "chrome", // Default profile name
+    profiles: {
+      openclaw: {
+        cdpPort: 18791,      // CDP debugging port
+        color: "#FF4500",    // Address bar color
+      },
+      chrome: {
+        driver: "extension", // Use Chrome Extension Relay
+        cdpUrl: "http://127.0.0.1:18792",
+        color: "#00AA00",
+      },
+    },
+    snapshotDefaults: {
+      mode: "efficient",     // Reduce token cost
+    },
+  },
+}
+```
+
+#### Key Design Insights
+
+1. **Snapshot-first interaction**: The agent reads pages via structured text snapshots (not screenshots), enabling efficient token usage and precise element targeting via refs. Screenshots are used for visual verification, not primary navigation
+2. **Profile isolation**: The `openclaw` profile uses a completely separate Chrome user data directory, preventing contamination of the user's cookies, history, and extensions
+3. **Extension relay bridge**: The Chrome Extension Relay allows the agent to control tabs in the user's *actual* Chrome session — seeing their logged-in state, cookies, and context — while keeping the control path secure via a local relay server with token auth
+4. **Three-target flexibility**: The same tool interface works whether the browser runs locally, in a Docker sandbox, or on a remote device node. The agent doesn't need to know the execution target
+5. **60+ Playwright operations**: The `pw-tools-core.ts` module exposes a comprehensive set of browser automation primitives, from basic click/type to advanced operations like tracing, geolocation spoofing, media emulation, and storage manipulation
 
 ---
 
